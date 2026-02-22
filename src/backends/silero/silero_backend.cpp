@@ -1,0 +1,369 @@
+/*
+ * Silero VAD Backend Implementation
+ */
+
+#include "silero_backend.hpp"
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <chrono>
+#include <iostream>
+#include <memory>
+#include <numeric>
+#include <string>
+#include <vector>
+
+namespace vad {
+
+// LSTM hidden size for Silero VAD
+static constexpr size_t LSTM_HIDDEN_SIZE = 128;
+static constexpr size_t LSTM_NUM_LAYERS = 2;
+static constexpr size_t STATE_SIZE = LSTM_NUM_LAYERS * 1 * LSTM_HIDDEN_SIZE;  // (2, 1, 128)
+
+SileroBackend::SileroBackend()
+    : memory_info_(Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)) {
+}
+
+SileroBackend::~SileroBackend() {
+    shutdown();
+}
+
+void SileroBackend::shutdown() {
+    // Clear vectors that may reference session data first
+    input_names_.clear();
+    output_names_.clear();
+    input_names_str_.clear();
+    output_names_str_.clear();
+    state_h_.clear();
+    state_c_.clear();
+    context_.clear();
+    prob_history_.clear();
+
+    // Release ONNX resources in correct order: session before env
+    session_.reset();
+    env_.reset();
+}
+
+std::string SileroBackend::expandPath(const std::string& path) {
+    if (path.empty()) return path;
+
+    std::string result = path;
+    if (result[0] == '~') {
+        const char* home = getenv("HOME");
+        if (home) {
+            result = std::string(home) + result.substr(1);
+        }
+    }
+    return result;
+}
+
+std::string SileroBackend::findModelPath(const std::string& model_dir) {
+    std::string dir = expandPath(model_dir);
+
+    // Try common model file names
+    std::vector<std::string> candidates = {
+        dir + "/silero_vad.onnx",
+        dir + "/silero_vad_v5.onnx",
+        dir + "/model.onnx",
+        dir  // If model_dir is actually a file path
+    };
+
+    for (const auto& path : candidates) {
+        struct stat st;
+        if (stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
+            return path;
+        }
+    }
+
+    // Try default paths
+    const char* home = getenv("HOME");
+    if (home) {
+        std::vector<std::string> default_paths = {
+            std::string(home) + "/.cache/silero_vad/silero_vad.onnx",
+            std::string(home) + "/.cache/sensevoice/silero_vad.onnx",  // Common location
+        };
+
+        for (const auto& path : default_paths) {
+            struct stat st;
+            if (stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
+                return path;
+            }
+        }
+    }
+
+    return "";
+}
+
+ErrorInfo SileroBackend::initialize(const VadConfig& config) {
+    config_ = config;
+
+    // Find model path
+    model_path_ = findModelPath(config.model_dir);
+    if (model_path_.empty()) {
+        return ErrorInfo::error(ErrorCode::MODEL_NOT_FOUND,
+            "Silero VAD model not found",
+            "Searched in: " + config.model_dir);
+    }
+
+    // Validate sample rate
+    if (config.sample_rate != 16000 && config.sample_rate != 8000) {
+        return ErrorInfo::error(ErrorCode::UNSUPPORTED_SAMPLE_RATE,
+            "Unsupported sample rate",
+            "Silero VAD supports 8000 or 16000 Hz, got: " + std::to_string(config.sample_rate));
+    }
+
+    // Initialize ONNX Runtime
+    if (!initializeSession()) {
+        return ErrorInfo::error(ErrorCode::BACKEND_ERROR,
+            "Failed to initialize ONNX session",
+            "Model path: " + model_path_);
+    }
+
+    // Reset state
+    reset();
+
+    return ErrorInfo::ok();
+}
+
+bool SileroBackend::initializeSession() {
+    try {
+        // Suppress stderr temporarily to avoid ONNX schema warnings
+        int stderr_fd = dup(STDERR_FILENO);
+        int devnull_fd = open("/dev/null", O_WRONLY);
+        if (devnull_fd >= 0) {
+            dup2(devnull_fd, STDERR_FILENO);
+        }
+
+        env_ = std::make_unique<Ort::Env>(ORT_LOGGING_LEVEL_WARNING, "SileroVAD");
+
+        // Restore stderr
+        if (stderr_fd >= 0) {
+            dup2(stderr_fd, STDERR_FILENO);
+            close(stderr_fd);
+        }
+        if (devnull_fd >= 0) {
+            close(devnull_fd);
+        }
+
+        Ort::SessionOptions session_options;
+        session_options.SetIntraOpNumThreads(config_.num_threads);
+        session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
+
+        session_ = std::make_unique<Ort::Session>(*env_, model_path_.c_str(), session_options);
+
+        // Get input/output names
+        Ort::AllocatorWithDefaultOptions allocator;
+
+        size_t num_inputs = session_->GetInputCount();
+        input_names_str_.clear();
+        input_names_.clear();
+        for (size_t i = 0; i < num_inputs; i++) {
+            auto name = session_->GetInputNameAllocated(i, allocator);
+            input_names_str_.push_back(std::string(name.get()));
+        }
+        for (const auto& name : input_names_str_) {
+            input_names_.push_back(name.c_str());
+        }
+
+        size_t num_outputs = session_->GetOutputCount();
+        output_names_str_.clear();
+        output_names_.clear();
+        for (size_t i = 0; i < num_outputs; i++) {
+            auto name = session_->GetOutputNameAllocated(i, allocator);
+            output_names_str_.push_back(std::string(name.get()));
+        }
+        for (const auto& name : output_names_str_) {
+            output_names_.push_back(name.c_str());
+        }
+
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "Failed to initialize ONNX session: " << e.what() << std::endl;
+        return false;
+    }
+}
+
+void SileroBackend::reset() {
+    // Initialize LSTM states
+    state_h_.assign(STATE_SIZE, 0.0f);
+    state_c_.assign(STATE_SIZE, 0.0f);
+    context_.assign(config_.context_size, 0.0f);
+    prob_history_.clear();
+
+    // Reset streaming state
+    current_state_ = VadState::SILENCE;
+    speech_start_time_ = -1;
+    frame_count_ = 0;
+}
+
+float SileroBackend::runInference(const float* audio, size_t length) {
+    if (!session_) {
+        return 0.0f;
+    }
+
+    try {
+        // Prepare input audio (pad or truncate to window_size)
+        std::vector<float> input_audio(config_.window_size);
+        size_t copy_len = std::min(length, static_cast<size_t>(config_.window_size));
+        std::copy(audio, audio + copy_len, input_audio.begin());
+        if (copy_len < static_cast<size_t>(config_.window_size)) {
+            std::fill(input_audio.begin() + copy_len, input_audio.end(), 0.0f);
+        }
+
+        // Concatenate context and current audio
+        std::vector<float> x(config_.context_size + config_.window_size);
+        std::copy(context_.begin(), context_.end(), x.begin());
+        std::copy(input_audio.begin(), input_audio.end(), x.begin() + config_.context_size);
+
+        // Update context for next frame
+        std::copy(x.end() - config_.context_size, x.end(), context_.begin());
+
+        // Prepare input tensors
+        std::vector<int64_t> input_shape = {1, static_cast<int64_t>(x.size())};
+        std::vector<int64_t> sr_shape = {1};
+        std::vector<int64_t> state_shape = {LSTM_NUM_LAYERS, 1, LSTM_HIDDEN_SIZE};
+
+        std::vector<int64_t> sr_value = {config_.sample_rate};
+
+        std::vector<Ort::Value> input_tensors;
+        input_tensors.push_back(Ort::Value::CreateTensor<float>(
+            memory_info_, x.data(), x.size(), input_shape.data(), input_shape.size()));
+        input_tensors.push_back(Ort::Value::CreateTensor<float>(
+            memory_info_, state_h_.data(), state_h_.size(), state_shape.data(), state_shape.size()));
+        input_tensors.push_back(Ort::Value::CreateTensor<int64_t>(
+            memory_info_, sr_value.data(), sr_value.size(), sr_shape.data(), sr_shape.size()));
+
+        // Run inference
+        auto output_tensors = session_->Run(
+            Ort::RunOptions{nullptr},
+            input_names_.data(), input_tensors.data(), input_tensors.size(),
+            output_names_.data(), output_names_.size());
+
+        // Get probability
+        float* prob_data = output_tensors[0].GetTensorMutableData<float>();
+        float prob = prob_data[0];
+
+        // Update LSTM states
+        if (output_tensors.size() > 2) {
+            float* new_state_h = output_tensors[1].GetTensorMutableData<float>();
+            std::copy(new_state_h, new_state_h + state_h_.size(), state_h_.begin());
+
+            float* new_state_c = output_tensors[2].GetTensorMutableData<float>();
+            std::copy(new_state_c, new_state_c + state_c_.size(), state_c_.begin());
+        } else if (output_tensors.size() > 1) {
+            float* new_state_h = output_tensors[1].GetTensorMutableData<float>();
+            std::copy(new_state_h, new_state_h + state_h_.size(), state_h_.begin());
+        }
+
+        return prob;
+    } catch (const std::exception& e) {
+        std::cerr << "Silero VAD inference error: " << e.what() << std::endl;
+        return 0.0f;
+    }
+}
+
+float SileroBackend::applySmoothing(float prob) {
+    if (!config_.use_smoothing) {
+        return prob;
+    }
+
+    prob_history_.push_back(prob);
+    while (prob_history_.size() > static_cast<size_t>(config_.smoothing_window)) {
+        prob_history_.pop_front();
+    }
+
+    return std::accumulate(prob_history_.begin(), prob_history_.end(), 0.0f)
+            / prob_history_.size();
+}
+
+VadState SileroBackend::updateState(float smoothed_prob, DetectionResult& result) {
+    VadState new_state = current_state_;
+
+    bool is_speech = smoothed_prob >= config_.trigger_threshold;
+    bool is_silence = smoothed_prob < config_.stop_threshold;
+
+    // Frame duration in ms
+    int frame_duration_ms = (config_.window_size * 1000) / config_.sample_rate;
+    int64_t current_time_ms = frame_count_ * frame_duration_ms;
+
+    switch (current_state_) {
+        case VadState::SILENCE:
+            if (is_speech) {
+                new_state = VadState::SPEECH_START;
+                speech_start_time_ = current_time_ms;
+                result.speech_start_ms = speech_start_time_;
+            }
+            break;
+
+        case VadState::SPEECH_START:
+            if (is_speech) {
+                new_state = VadState::SPEECH;
+            } else if (is_silence) {
+                new_state = VadState::SILENCE;
+                speech_start_time_ = -1;
+            }
+            break;
+
+        case VadState::SPEECH:
+            if (is_silence) {
+                new_state = VadState::SPEECH_END;
+                result.speech_end_ms = current_time_ms;
+                result.speech_duration_ms = static_cast<int>(current_time_ms - speech_start_time_);
+            }
+            break;
+
+        case VadState::SPEECH_END:
+            if (is_speech) {
+                new_state = VadState::SPEECH_START;
+                speech_start_time_ = current_time_ms;
+                result.speech_start_ms = speech_start_time_;
+            } else {
+                new_state = VadState::SILENCE;
+                speech_start_time_ = -1;
+            }
+            break;
+    }
+
+    current_state_ = new_state;
+    return new_state;
+}
+
+ErrorInfo SileroBackend::detect(const AudioChunk& audio, DetectionResult& result) {
+    if (!session_) {
+        return ErrorInfo::error(ErrorCode::NOT_INITIALIZED,
+            "Backend not initialized");
+    }
+
+    auto start_time = std::chrono::steady_clock::now();
+
+    // Run inference
+    float prob = runInference(audio.data, audio.num_samples);
+    float smoothed_prob = applySmoothing(prob);
+
+    // Update state
+    VadState state = updateState(smoothed_prob, result);
+
+    auto end_time = std::chrono::steady_clock::now();
+    auto processing_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+        end_time - start_time).count();
+
+    // Fill result
+    result.probability = prob;
+    result.smoothed_probability = smoothed_prob;
+    result.state = state;
+    result.is_speech = (state == VadState::SPEECH_START || state == VadState::SPEECH);
+    result.processing_time_ms = static_cast<int>(processing_time);
+
+    // Calculate timestamp
+    int frame_duration_ms = (config_.window_size * 1000) / config_.sample_rate;
+    result.timestamp_ms = frame_count_ * frame_duration_ms;
+
+    frame_count_++;
+
+    return ErrorInfo::ok();
+}
+
+}  // namespace vad
