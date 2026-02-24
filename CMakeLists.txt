@@ -44,6 +44,9 @@ if(NOT ONNXRUNTIME_LIB)
     )
 endif()
 
+# libcurl (for model auto-download)
+find_package(CURL REQUIRED)
+
 # -------------------------------------------------------
 # Silero Backend Library
 # -------------------------------------------------------
@@ -62,7 +65,7 @@ target_include_directories(silero_vad PUBLIC
 
 target_link_libraries(silero_vad
     PUBLIC ${ONNXRUNTIME_LIB}
-    PRIVATE pthread
+    PRIVATE CURL::libcurl pthread
 )
 
 set_target_properties(silero_vad PROPERTIES

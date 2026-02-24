@@ -4,12 +4,15 @@
 
 #include "silero_backend.hpp"
 
+#include <curl/curl.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <numeric>
@@ -17,6 +20,61 @@
 #include <vector>
 
 namespace vad {
+
+// CURL write callback
+static size_t writeCallback(void* contents, size_t size, size_t nmemb, void* userp) {
+    std::ofstream* file = static_cast<std::ofstream*>(userp);
+    size_t total_size = size * nmemb;
+    file->write(static_cast<const char*>(contents), total_size);
+    return total_size;
+}
+
+// Download a single file via CURL
+static bool downloadModel(const std::string& url, const std::string& output_path) {
+    CURL* curl = curl_easy_init();
+    if (!curl) {
+        std::cerr << "[SileroVAD] Failed to init curl" << std::endl;
+        return false;
+    }
+
+    std::ofstream file(output_path, std::ios::binary);
+    if (!file.is_open()) {
+        std::cerr << "[SileroVAD] Cannot open: " << output_path << std::endl;
+        curl_easy_cleanup(curl);
+        return false;
+    }
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &file);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "SileroVAD/1.0");
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+
+    CURLcode res = curl_easy_perform(curl);
+
+    int64_t response_code;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+
+    curl_easy_cleanup(curl);
+    file.close();
+
+    if (res != CURLE_OK) {
+        std::cerr << "[SileroVAD] Download failed: " << curl_easy_strerror(res) << std::endl;
+        std::filesystem::remove(output_path);
+        return false;
+    }
+
+    if (response_code != 200) {
+        std::cerr << "[SileroVAD] HTTP error: " << response_code << std::endl;
+        std::filesystem::remove(output_path);
+        return false;
+    }
+
+    std::cout << "[SileroVAD] Downloaded: " << output_path << std::endl;
+    return true;
+}
 
 // LSTM hidden size for Silero VAD
 static constexpr size_t LSTM_HIDDEN_SIZE = 128;
@@ -82,6 +140,7 @@ std::string SileroBackend::findModelPath(const std::string& model_dir) {
     const char* home = getenv("HOME");
     if (home) {
         std::vector<std::string> default_paths = {
+            std::string(home) + "/.cache/silero/silero_vad.onnx",
             std::string(home) + "/.cache/silero_vad/silero_vad.onnx",
             std::string(home) + "/.cache/sensevoice/silero_vad.onnx",  // Common location
         };
@@ -94,6 +153,18 @@ std::string SileroBackend::findModelPath(const std::string& model_dir) {
         }
     }
 
+    // Model not found anywhere, try auto-download
+    std::string download_dir = expandPath("~/.cache/silero");
+    std::filesystem::create_directories(download_dir);
+    std::string download_path = download_dir + "/silero_vad.onnx";
+
+    std::cout << "[SileroVAD] Model not found locally, downloading..." << std::endl;
+    if (downloadModel("https://archive.spacemit.com/spacemit-ai/onnx_models/silero_vad.onnx",
+                       download_path)) {
+        return download_path;
+    }
+
+    std::cerr << "[SileroVAD] Auto-download failed" << std::endl;
     return "";
 }
 
