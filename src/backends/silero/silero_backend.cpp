@@ -159,7 +159,7 @@ std::string SileroBackend::findModelPath(const std::string& model_dir) {
     std::string download_path = download_dir + "/silero_vad.onnx";
 
     std::cout << "[SileroVAD] Model not found locally, downloading..." << std::endl;
-    if (downloadModel("https://archive.spacemit.com/spacemit-ai/onnx_models/silero_vad.onnx",
+    if (downloadModel("https://archive.spacemit.com/spacemit-ai/model_zoo/vad/silero/silero_vad.onnx",
                        download_path)) {
         return download_path;
     }
